@@ -105,8 +105,10 @@ def landy_szalay(pts):
     """Landy–Szalay estimator for periodic box."""
     nD, nR = pts.shape[0], _RAND.shape[0]
     dt = cKDTree(pts, boxsize=1.0)
-    dd = np.diff(np.concatenate([[0], dt.count_neighbors(dt, R_EDGES[1:])]))
-    dr = np.diff(np.concatenate([[0], dt.count_neighbors(_RTREE, R_EDGES[1:])]))
+
+
+    dd = np.diff(np.concatenate([[0], dt.count_neighbors(dt, R_EDGES[1:])])).astype(float)
+    dr = np.diff(np.concatenate([[0], dt.count_neighbors(_RTREE, R_EDGES[1:])])).astype(float)
     rr = np.diff(np.concatenate([[0], _RR_CUM])).astype(float)
     dd[0] = max(dd[0] - nD, 0)
     rr[0] = max(rr[0] - nR, 0)
