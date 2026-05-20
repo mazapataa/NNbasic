@@ -228,6 +228,7 @@ class ConditionalPointFlow(nn.Module):
         else:
             return outs
 
+    @torch.no_grad()
     def sample(self, condition, n_points, device=torch.device('cpu')):
         B = condition.shape[0]
         z = [torch.randn(n_points, 2, device=device) for _ in range(B)]
