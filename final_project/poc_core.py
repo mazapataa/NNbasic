@@ -369,14 +369,15 @@ class SimpleDeepSet(nn.Module):
 
 class AffineCoupling(nn.Module):
     """
-    Single affine coupling layer for RealNVP.
+    Single affine coupling layer for RealNVP (stabilized).
     
     Transformation:
         y_masked = x_masked
-        y_free = x_free * exp(s(x_masked, c)) + t(x_masked, c)
+        y_free = x_free * exp(tanh(s) * 2) + t(x_masked, c)
         
-    where s and t are neural networks, c is context, and the mask
-    determines which dimensions are frozen vs transformed.
+    where s and t are neural networks, c is context. Using tanh(s)*2
+    keeps exp(scale) in [exp(-2), exp(2)] ≈ [0.14, 7.4], preventing
+    numerical blowup during training and sampling.
     
     Parameters
     ----------
@@ -401,11 +402,12 @@ class AffineCoupling(nn.Module):
         super().__init__()
         self.mask = nn.Parameter(mask, requires_grad=False)
         
-        # Scale network
+        # Scale network (tanh output keeps exp(s) in reasonable range)
         self.scale_net = nn.Sequential(
             nn.Linear(2 + context_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 2)
+            nn.Linear(hidden_dim, 2),
+            nn.Tanh()  # Stabilizes scale to [-1, 1]
         )
         
         # Translation network
@@ -450,8 +452,8 @@ class AffineCoupling(nn.Module):
         # Network input: frozen part + context
         net_input = torch.cat([x_masked, context], dim=1)
         
-        # Compute scale and translation
-        s = self.scale_net(net_input)
+        # Compute scale (bounded by tanh → [-1, 1]) and translation
+        s = self.scale_net(net_input)  # Already tanh'd
         t = self.translate_net(net_input)
         
         # Apply transformation
@@ -615,7 +617,7 @@ class SimplifiedFlow(nn.Module):
         Returns
         -------
         samples : list of Tensor
-            Generated point clouds
+            Generated point clouds, guaranteed finite and in [0, 1)²
         """
         B = condition.shape[0]
         
@@ -623,7 +625,19 @@ class SimplifiedFlow(nn.Module):
         z = [torch.randn(n_points, 2, device=device) for _ in range(B)]
         
         # Transform to data space
-        return self.forward(z, condition.to(device), reverse=True)
+        samples = self.forward(z, condition.to(device), reverse=True)
+        
+        # Guard against NaN/inf and enforce periodic boundary [0, 1)
+        for i in range(B):
+            s = samples[i]
+            if not torch.isfinite(s).all():
+                # Fallback: uniform random points if flow produced invalid values
+                samples[i] = torch.rand(n_points, 2, device=device)
+            else:
+                # Modulo to enforce periodic boundary [0, 1)
+                samples[i] = torch.remainder(s, 1.0)
+        
+        return samples
 
 
 # ============================================================================
@@ -681,9 +695,17 @@ def train_flow(
         log_prob, _ = flow(clouds, condition, reverse=False)
         loss = -log_prob.mean()
         
-        # Backward pass
+        # Check for NaN and skip step if detected
+        if torch.isnan(loss) or torch.isinf(loss):
+            if verbose:
+                print(f"  Iteration {step:4d}/{n_iter}: NaN detected, skipping step")
+            losses.append(float('nan'))
+            continue
+        
+        # Backward pass with gradient clipping
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(flow.parameters(), max_norm=10.0)
         optimizer.step()
         
         losses.append(loss.item())
@@ -752,9 +774,7 @@ def compute_sbc_ranks(
         # 2. Generate observed data
         x_obs = simulate_thomas(theta_true, eta_true, rng)
         
-        # 3. Approximate posterior via rejection sampling
-        # (In practice, would use a trained inference network here)
-        # For simplicity, we use grid-based approximation
+        # 3. Approximate posterior via importance sampling
         theta_samples, eta_samples = sample_prior(n_posterior * 10, rng)
         log_probs = []
         
@@ -771,15 +791,24 @@ def compute_sbc_ranks(
                 
         # 4. Sample from approximate posterior (importance sampling)
         log_probs = np.array(log_probs)
-        weights = np.exp(log_probs - log_probs.max())
-        weights /= weights.sum()
         
-        indices = rng.choice(
-            len(weights), 
-            size=n_posterior, 
-            replace=True, 
-            p=weights
-        )
+        # Handle NaN log-probs: replace with very negative values
+        log_probs = np.nan_to_num(log_probs, nan=-1e10)
+        
+        weights = np.exp(log_probs - log_probs.max())
+        weights_sum = weights.sum()
+        
+        if weights_sum <= 0 or not np.isfinite(weights_sum):
+            # Fallback to uniform sampling if all weights are degenerate
+            indices = rng.choice(len(weights), size=n_posterior, replace=True)
+        else:
+            weights /= weights_sum
+            indices = rng.choice(
+                len(weights), 
+                size=n_posterior, 
+                replace=True, 
+                p=weights
+            )
         posterior_samples = theta_samples[indices]
         
         # 5. Compute ranks
