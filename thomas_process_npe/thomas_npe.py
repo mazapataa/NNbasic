@@ -1,419 +1,226 @@
-"""
-thomas_npe.py  –  Beginner-Friendly Neural Posterior Estimation
-================================================================
-A self-contained, single-file implementation of the NPE pipeline from
-Cranmer et al. (2020) applied to the Thomas Cluster Process.
+from __future__ import annotations
 
-WHAT THIS DOES (in plain English)
------------------------------------
-1. Simulate galaxy clusters using the Thomas point process.
-   - A Thomas process has two parameters we want to recover:
-       mu    : average number of galaxies per cluster  (e.g. 5–30)
-       sigma : spatial spread of galaxies around each cluster centre (e.g. 0.02–0.12)
-
-2. Summarise each simulated catalog with a small set of numbers
-   (summary statistics: galaxy count, mean nearest-neighbor distance, …).
-
-3. Train a normalizing flow (a neural network that learns probability
-   distributions) to approximate  p(mu, sigma | summary_stats).
-
-4. Validate the learned posterior with:
-   - Posterior predictive check  (does the posterior explain the data?)
-   - Simulation-Based Calibration (SBC) — are the error bars correct?)
-   - Coverage test
-
-HOW TO RUN
-----------
-    pip install numpy scipy matplotlib torch
-    python thomas_npe.py
-
-All outputs are saved to ./npe_outputs/.
-Expected runtime: ~3 min on a laptop CPU.
-
-REFERENCES
-----------
-Cranmer, Brehmer & Louppe (2020)  "The frontier of simulation-based inference"
-    PNAS 117(48) 30055–30062   https://arxiv.org/abs/1911.01429
-
-Thomas (1949) "A generalization of Poisson's binomial limit for use in ecology"
-    Biometrika 36(1-2) 18–25
-
-Talts et al. (2018) "Validating Bayesian inference algorithms with SBC"
-    https://arxiv.org/abs/1804.06788
-"""
-
-# ── Standard library ──────────────────────────────────────────────────────────
-import os, time
-from pathlib import Path
-
-# ── Scientific stack ──────────────────────────────────────────────────────────
+import time
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from scipy.spatial import cKDTree
-from scipy.stats import chi2 as chi2_dist
-
-# ── PyTorch ───────────────────────────────────────────────────────────────────
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# ── Reproducibility ───────────────────────────────────────────────────────────
-SEED = 42
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-RNG = np.random.default_rng(SEED)
+#  Constants & priors
 
-# ── Output directory ──────────────────────────────────────────────────────────
-OUT = Path("npe_outputs")
-OUT.mkdir(exist_ok=True)
 
-# =============================================================================
-# SECTION 1 — THE THOMAS CLUSTER PROCESS
-# =============================================================================
-#
-# A Thomas process generates galaxy positions in two steps:
-#
-#   Step 1. Scatter N_parent "cluster centres" uniformly in the unit square.
-#           N_parent ~ Poisson(lambda_p), with lambda_p fixed (we don't
-#           infer it — it's a nuisance we marginalise by fixing).
-#
-#   Step 2. Around each centre j, generate N_j galaxies,
-#           where N_j ~ Poisson(mu) and each galaxy position is
-#               x_ij = centre_j + Normal(0, sigma^2 * I)
-#
-# Parameters we INFER:
-#   mu    in [MU_LO,  MU_HI]    mean galaxies per cluster
-#   sigma in [SIG_LO, SIG_HI]   cluster spread (in [0,1] box units)
-#
-# Fixed nuisance:
-#   lambda_p = 20  (number of cluster centres)
-# =============================================================================
+LAMBDA_P  = 20          # fixed parent count
+MU_LO     = 3.0         # prior lower bound on μ
+MU_HI     = 25.0        # prior upper bound on μ
+SIG_LO    = 0.02        # prior lower bound on σ
+SIG_HI    = 0.12        # prior upper bound on σ
+GRID_SIZE = 32          # pixelisation resolution (G × G)
+PK_BINS   = 10          # number of P(k) wavenumber bins
 
-LAMBDA_P = 20       # fixed number of cluster parents
-MU_LO,  MU_HI  = 3.0,  25.0   # prior on mu
-SIG_LO, SIG_HI = 0.02,  0.12  # prior on sigma
+
+
+#  1. Thomas process simulator
 
 
 def simulate_thomas(mu: float, sigma: float,
                     rng: np.random.Generator) -> np.ndarray:
     """
-    Generate one Thomas-process galaxy catalog.
+    Generate one Thomas-process galaxy catalog in [0, 1)^2.
 
     Parameters
     ----------
-    mu    : mean galaxies per cluster
-    sigma : spatial spread of galaxies (box units)
-    rng   : numpy random generator
+    mu    : mean offspring per cluster
+    sigma : Gaussian scatter of offspring (box units)
+    rng   : numpy Generator for reproducibility
 
     Returns
     -------
-    catalog : (N, 2) array of galaxy positions in [0, 1]^2
-              Returns at least 5 points (padded with uniform noise if needed).
+    positions : (N, 2) float32 array of galaxy positions
     """
-    # Cluster centres
     parents = rng.uniform(0.0, 1.0, (LAMBDA_P, 2))
-
-    # Galaxy counts per cluster
-    n_per_cluster = rng.poisson(mu, size=LAMBDA_P)
-    total = int(n_per_cluster.sum())
-
-    if total == 0:
-        return rng.uniform(0.0, 1.0, (5, 2)).astype(np.float32)
-
-    # Scatter galaxies around their parent
-    parent_repeated = np.repeat(parents, n_per_cluster, axis=0)  # (total, 2)
-    offsets = rng.normal(0.0, sigma, size=(total, 2))
-    positions = parent_repeated + offsets
-
-    # Wrap to [0, 1] (periodic boundary)
-    positions = np.mod(positions, 1.0)
-
+    n_per   = rng.poisson(mu, LAMBDA_P)
+    total   = int(n_per.sum())
+    if total == 0:                              # edge case
+        return rng.uniform(0, 1, (5, 2)).astype(np.float32)
+    parent_rep = np.repeat(parents, n_per, axis=0)
+    offsets    = rng.normal(0.0, sigma, (total, 2))
+    positions  = np.mod(parent_rep + offsets, 1.0)
     return positions.astype(np.float32)
 
 
 def sample_prior(n: int, rng: np.random.Generator) -> np.ndarray:
-    """
-    Draw n parameter pairs (mu, sigma) from the uniform prior.
-
-    Returns
-    -------
-    theta : (n, 2) array, columns = [mu, sigma]
-    """
-    mu    = rng.uniform(MU_LO,  MU_HI,  size=n)
-    sigma = rng.uniform(SIG_LO, SIG_HI, size=n)
+    """Draw *n* parameter pairs (μ, σ) from the uniform prior."""
+    mu    = rng.uniform(MU_LO,  MU_HI,  n)
+    sigma = rng.uniform(SIG_LO, SIG_HI, n)
     return np.column_stack([mu, sigma]).astype(np.float32)
 
 
-# =============================================================================
-# SECTION 2 — SUMMARY STATISTICS
-# =============================================================================
-#
-# The NPE does NOT receive the raw point cloud.  Instead we compress each
-# catalog into a small fixed-length vector of summary statistics.
-#
-# We use 5 statistics:
-#   s0 : log(1 + N)                            — galaxy count (log-scaled)
-#   s1 : mean nearest-neighbour distance        — small-scale clustering
-#   s2 : std  nearest-neighbour distance        — clustering homogeneity
-#   s3 : fraction of galaxies within r=0.05     — cluster compactness
-#   s4 : Ripley's L(r) - r  at r=0.06          — excess clustering relative
-#                                                  to Poisson baseline
-#
-# Why these?  Each statistic captures a different aspect of clustering that
-# depends on (mu, sigma) in a different way, helping break degeneracies.
-# =============================================================================
-
-# Pre-computed random reference catalog for Ripley's L estimator
-_REF_CAT = RNG.uniform(0.0, 1.0, (2000, 2))
-_REF_TREE = cKDTree(_REF_CAT, boxsize=1.0)
-
-RIPLEY_R   = 0.06    # radius for Ripley's L
-COMPACT_R  = 0.05    # radius for fraction-within test
-N_STATS    = 5       # total dimension of the summary vector
-
-
-def compute_summary(catalog: np.ndarray) -> np.ndarray:
+def analytical_pk(k: np.ndarray, mu: float, sigma: float) -> np.ndarray:
     """
-    Compress a galaxy catalog into a 5-dimensional summary vector.
-
-    Parameters
-    ----------
-    catalog : (N, 2) float array, positions in [0, 1)^2
-
-    Returns
-    -------
-    stats : (5,) float32 array
+    Closed-form Thomas-process power spectrum (Eq. 2 of the report).
     """
-    N = len(catalog)
-
-    # ── s0: log-galaxy count ─────────────────────────────────────────────────
-    s0 = np.log1p(N) / 5.0       # normalise to roughly [0, 1]
-
-    if N < 4:
-        return np.array([s0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
-
-    # ── s1, s2: nearest-neighbour distances ──────────────────────────────────
-    tree = cKDTree(catalog, boxsize=1.0)
-    # k=2 because k=1 returns the point itself (distance 0)
-    nn_dist, _ = tree.query(catalog, k=2, workers=-1)
-    nn_dist = nn_dist[:, 1]       # first *other* neighbour
-    s1 = float(nn_dist.mean()) * 10.0   # scale up from ~0.01–0.10
-    s2 = float(nn_dist.std())  * 10.0
-
-    # ── s3: fraction within compact radius ───────────────────────────────────
-    counts = tree.query_ball_point(catalog, COMPACT_R, return_length=True)
-    s3 = float(np.mean(counts - 1)) / 20.0    # subtract self, normalise
-
-    # ── s4: Ripley's L(r) - r (excess over Poisson) ──────────────────────────
-    # K(r) = (area / N^2) * #{pairs within r}
-    # L(r) = sqrt(K(r) / pi)
-    pairs = tree.query_ball_point(catalog, RIPLEY_R, return_length=True)
-    n_pairs = int(np.sum(pairs - 1))  # subtract self-pairs
-    K = (1.0 / (N * (N - 1))) * n_pairs if N > 1 else 0.0
-    L = np.sqrt(K / np.pi + 1e-12) - RIPLEY_R
-    s4 = float(L) * 5.0
-
-    return np.array([s0, s1, s2, s3, s4], dtype=np.float32)
+    n_bar = LAMBDA_P * mu
+    return 1.0 / n_bar + (mu**2 / LAMBDA_P) * np.exp(-k**2 * sigma**2)
 
 
-# =============================================================================
-# SECTION 3 — NORMALIZING FLOW (the neural network)
-# =============================================================================
-#
-# A normalizing flow is a neural network f_phi that maps a simple base
-# distribution (standard Normal) to a complex target distribution
-# (our posterior) via a sequence of invertible transformations.
-#
-# We use a SIMPLE 3-layer Real-NVP (Real-valued Non-Volume Preserving):
-#   - Each layer splits theta = (theta_0, theta_1)
-#   - One part is transformed as:
-#       z_1 = theta_1 * exp(s(theta_0, context)) + t(theta_0, context)
-#     where s, t are small neural networks conditioned on the context
-#     (the summary statistics).
-#   - The log-determinant of the Jacobian is simply sum(s).
-#
-# WHY A FLOW?  Because we can compute log p(theta | x) in one forward pass
-# and sample from p(theta | x) by inverting the transformation.
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════
+#  2. Field representation — pixelisation
+# ═══════════════════════════════════════════════════════════════════════
 
-class CouplingNet(nn.Module):
+def pixelise(catalog: np.ndarray,
+             grid_size: int = GRID_SIZE) -> np.ndarray:
     """
-    Small MLP that computes (scale, shift) for one coupling layer.
-    Input:  half of theta + summary statistics context
-    Output: scale (s) and translation (t) for the other half of theta
+    Histogram galaxy positions onto a (G × G) grid and log-compress.
+
+    The output has shape (1, G, G), ready for a Conv2d input channel.
+    Permutation-invariant by construction.
     """
-    def __init__(self, in_dim: int, context_dim: int, hidden: int = 64):
+    H, _, _ = np.histogram2d(
+        catalog[:, 0], catalog[:, 1],
+        bins=grid_size, range=[[0.0, 1.0], [0.0, 1.0]],
+    )
+    return np.log1p(H).astype(np.float32)[np.newaxis]     # (1, G, G)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  3. CNN embedding network
+# ═══════════════════════════════════════════════════════════════════════
+
+class CNNEmbedding(nn.Module):
+    """
+    Three-block ConvNet that compresses a (1, 32, 32) density field
+    into a context vector of dimension *out_dim*.
+    """
+
+    def __init__(self, out_dim: int = 32):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim + context_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, in_dim * 2),   # outputs: [scale | shift]
+        self.conv = nn.Sequential(
+            nn.Conv2d(1,  16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(),
+            nn.AvgPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.AvgPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.AvgPool2d(2),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(64 * 4 * 4, 128), nn.ReLU(),
+            nn.Linear(128, out_dim),
         )
 
-    def forward(self, x_fixed: torch.Tensor,
-                context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        inp = torch.cat([x_fixed, context], dim=-1)
-        out = self.net(inp)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, 1, 32, 32) → (B, out_dim)."""
+        h = self.conv(x)
+        return self.fc(h.view(h.size(0), -1))
+
+
+
+#  4. Normalizing flow — Real-NVP
+class _CouplingNet(nn.Module):
+    """Scale-and-shift MLP for one coupling layer."""
+
+    def __init__(self, in_dim: int, ctx_dim: int, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim + ctx_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden),           nn.Tanh(),
+            nn.Linear(hidden, in_dim * 2),
+        )
+
+    def forward(self, x_fixed, ctx):
+        out = self.net(torch.cat([x_fixed, ctx], dim=-1))
         s, t = out.chunk(2, dim=-1)
-        s = torch.tanh(s) * 2.0   # clamp scale to avoid explosions
-        return s, t
+        return torch.tanh(s) * 2.0, t          # clamp scale
 
 
 class RealNVP(nn.Module):
     """
-    3-layer Real-NVP normalizing flow for 2D parameters.
+    Real-NVP normalizing flow for 2-D parameters.
 
-    The flow alternates which dimension is "fixed" vs "transformed":
-      Layer 0: fix dim 0, transform dim 1
-      Layer 1: fix dim 1, transform dim 0
-      Layer 2: fix dim 0, transform dim 1
-
-    This ensures both parameters are updated in every two layers.
-
-    Parameters
-    ----------
-    context_dim : dimension of the summary statistics vector
-    hidden      : hidden layer width in coupling networks
-    n_layers    : number of coupling layers
+    
     """
-    def __init__(self, context_dim: int = N_STATS,
-                 hidden: int = 64, n_layers: int = 3):
+
+    def __init__(self, ctx_dim: int = 32, hidden: int = 64,
+                 n_layers: int = 5):
         super().__init__()
         self.n_layers = n_layers
-        # Each layer: one coupling net for each "fixed" dimension choice
-        self.nets = nn.ModuleList([
-            CouplingNet(1, context_dim, hidden)
-            for _ in range(n_layers)
+        self.nets   = nn.ModuleList([
+            _CouplingNet(1, ctx_dim, hidden) for _ in range(n_layers)
         ])
-        # Which dim is fixed in each layer: alternates 0, 1, 0, 1, …
-        self.fixed_dims  = [i % 2 for i in range(n_layers)]
-        self.transf_dims = [(i + 1) % 2 for i in range(n_layers)]
+        self._fixed  = [i % 2 for i in range(n_layers)]
+        self._transf = [(i + 1) % 2 for i in range(n_layers)]
 
+    # ── forward: θ → z ───────────────────────────────────────────────
     def forward(self, theta: torch.Tensor,
-                context: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass: theta → latent z, compute log |det J|.
-
-        Parameters
-        ----------
-        theta   : (B, 2) parameter tensor (normalised to [-1, 1]^2)
-        context : (B, C) summary statistics
-
-        Returns
-        -------
-        z       : (B, 2) latent variable
-        log_det : (B,)   log |det J| = sum of log-scales
-        """
-        z = theta.clone()
-        log_det = torch.zeros(theta.shape[0], device=theta.device)
-
+                ctx: torch.Tensor):
+        z   = theta.clone()
+        ldj = torch.zeros(theta.shape[0], device=theta.device)
         for i, net in enumerate(self.nets):
-            fd = self.fixed_dims[i]
-            td = self.transf_dims[i]
-
-            x_fixed = z[:, fd:fd+1]             # (B, 1)
-            x_transf = z[:, td:td+1]            # (B, 1)
-
-            s, t = net(x_fixed, context)
-            z_transf = x_transf * torch.exp(s) + t
-            log_det += s.squeeze(-1)
-
+            fd, td = self._fixed[i], self._transf[i]
+            s, t   = net(z[:, fd:fd+1], ctx)
+            z_new  = z[:, td:td+1] * torch.exp(s) + t
+            ldj   += s.squeeze(-1)
             z = z.clone()
-            z[:, td] = z_transf.squeeze(-1)
+            z[:, td] = z_new.squeeze(-1)
+        return z, ldj
 
-        return z, log_det
-
+    # ── inverse: z → θ ───────────────────────────────────────────────
     @torch.no_grad()
     def inverse(self, z: torch.Tensor,
-                context: torch.Tensor) -> torch.Tensor:
-        """
-        Inverse pass: latent z → theta (for sampling).
-
-        Parameters
-        ----------
-        z       : (B, 2) latent samples from Normal(0, I)
-        context : (B, C) or (1, C) summary statistics
-
-        Returns
-        -------
-        theta : (B, 2) parameter samples
-        """
+                ctx: torch.Tensor) -> torch.Tensor:
         theta = z.clone()
-        if context.shape[0] == 1:
-            context = context.expand(z.shape[0], -1)
-
-        # Layers in reverse order
+        if ctx.shape[0] == 1:
+            ctx = ctx.expand(z.shape[0], -1)
         for i in reversed(range(self.n_layers)):
-            net = self.nets[i]
-            fd = self.fixed_dims[i]
-            td = self.transf_dims[i]
-
-            x_fixed  = theta[:, fd:fd+1]
-            x_transf = theta[:, td:td+1]
-
-            s, t = net(x_fixed, context)
-            theta_transf = (x_transf - t) * torch.exp(-s)
-
-            theta = theta.clone()
-            theta[:, td] = theta_transf.squeeze(-1)
-
+            fd, td = self._fixed[i], self._transf[i]
+            s, t   = self.nets[i](theta[:, fd:fd+1], ctx)
+            th_new = (theta[:, td:td+1] - t) * torch.exp(-s)
+            theta  = theta.clone()
+            theta[:, td] = th_new.squeeze(-1)
         return theta
 
+    def log_prob(self, theta, ctx):
+        z, ldj = self.forward(theta, ctx)
+        log_base = -0.5 * (z ** 2).sum(-1) - np.log(2 * np.pi)
+        return log_base + ldj
+
+    def sample(self, ctx, n_samples: int = 1000):
+        z = torch.randn(n_samples, 2, device=ctx.device)
+        return self.inverse(z, ctx.expand(n_samples, -1))
+
+
+
+#  5. Combined model — CNN + Flow (end-to-end)
+
+class FieldNPE(nn.Module):
+    """
+    Full field-level NPE model.
+
+
+    """
+
+    def __init__(self, ctx_dim: int = 32, hidden: int = 64,
+                 n_layers: int = 5):
+        super().__init__()
+        self.cnn  = CNNEmbedding(out_dim=ctx_dim)
+        self.flow = RealNVP(ctx_dim=ctx_dim, hidden=hidden,
+                            n_layers=n_layers)
+
     def log_prob(self, theta: torch.Tensor,
-                 context: torch.Tensor) -> torch.Tensor:
-        """
-        Compute log p(theta | context).
-
-        Uses the change-of-variables formula:
-            log p(theta) = log p_base(z) + log |det J|
-        where p_base = Normal(0, I) and z = f(theta).
-
-        Parameters
-        ----------
-        theta   : (B, 2) parameters (normalised)
-        context : (B, C) summary statistics
-
-        Returns
-        -------
-        log_prob : (B,) log-posterior values
-        """
-        z, log_det = self.forward(theta, context)
-        # log Normal(0, I): -0.5 * ||z||^2 - D/2 * log(2pi)
-        log_base = -0.5 * (z ** 2).sum(dim=-1) - np.log(2 * np.pi)
-        return log_base + log_det
+                 field: torch.Tensor) -> torch.Tensor:
+        """theta (B,2), field (B,1,G,G) → (B,) log-prob."""
+        return self.flow.log_prob(theta, self.cnn(field))
 
     @torch.no_grad()
-    def sample(self, context: torch.Tensor,
-               n_samples: int = 1000) -> torch.Tensor:
-        """
-        Sample theta ~ p(theta | context).
-
-        Parameters
-        ----------
-        context  : (1, C) summary statistics for ONE observation
-        n_samples: number of samples to draw
-
-        Returns
-        -------
-        theta_samples : (n_samples, 2) parameter samples (normalised)
-        """
-        ctx = context.expand(n_samples, -1)
-        z   = torch.randn(n_samples, 2, device=context.device)
-        return self.inverse(z, ctx)
+    def sample(self, field: torch.Tensor,
+               n_samples: int = 5000) -> torch.Tensor:
+        """field (1,1,G,G) → (n_samples, 2) normalised samples."""
+        return self.flow.sample(self.cnn(field), n_samples)
 
 
-# =============================================================================
-# SECTION 4 — PARAMETER NORMALISATION
-# =============================================================================
-# The flow works best when parameters live in [-1, 1].
-# We linearly map:   mu    in [MU_LO,  MU_HI]  →  [-1, 1]
-#                    sigma in [SIG_LO, SIG_HI] →  [-1, 1]
+#  6. Parameter normalisation  
+
 
 def normalise(theta: np.ndarray) -> np.ndarray:
-    """Map (mu, sigma) from prior range to [-1, 1]^2."""
+    """Map (μ, σ) from prior range to [-1, 1]²."""
     out = theta.copy().astype(np.float32)
     out[:, 0] = 2.0 * (theta[:, 0] - MU_LO)  / (MU_HI  - MU_LO)  - 1.0
     out[:, 1] = 2.0 * (theta[:, 1] - SIG_LO) / (SIG_HI - SIG_LO) - 1.0
@@ -421,668 +228,222 @@ def normalise(theta: np.ndarray) -> np.ndarray:
 
 
 def unnormalise(theta_n: np.ndarray) -> np.ndarray:
-    """Inverse of normalise: [-1, 1]^2 → (mu, sigma) prior range."""
+    """Map [-1, 1]² back to physical (μ, σ)."""
     out = theta_n.copy().astype(np.float32)
     out[:, 0] = (theta_n[:, 0] + 1.0) / 2.0 * (MU_HI  - MU_LO)  + MU_LO
     out[:, 1] = (theta_n[:, 1] + 1.0) / 2.0 * (SIG_HI - SIG_LO) + SIG_LO
     return out
 
 
-# =============================================================================
-# SECTION 5 — TRAINING
-# =============================================================================
 
-def generate_training_data(n_sim: int,
-                           rng: np.random.Generator
-                           ) -> tuple[np.ndarray, np.ndarray]:
+#  7. Training utilities 
+
+def generate_training_data(
+    n_sim: int, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Generate n_sim (theta, summary_stats) pairs for training.
+    Simulate *n_sim* Thomas catalogs and pixelise them.
 
     Returns
     -------
-    theta : (n_sim, 2) normalised parameter array
-    stats : (n_sim, N_STATS) summary statistics array
+    theta_n : (n_sim, 2)            normalised parameters in [-1, 1]²
+    fields  : (n_sim, 1, G, G)     log-count density fields
     """
-    theta_raw = sample_prior(n_sim, rng)          # (n_sim, 2)
-    theta_n   = normalise(theta_raw)               # in [-1, 1]^2
-
-    stats_list = []
+    theta_raw = sample_prior(n_sim, rng)
+    theta_n   = normalise(theta_raw)
+    fields    = np.zeros((n_sim, 1, GRID_SIZE, GRID_SIZE),
+                         dtype=np.float32)
     for i in range(n_sim):
-        mu_i, sig_i = float(theta_raw[i, 0]), float(theta_raw[i, 1])
-        cat  = simulate_thomas(mu_i, sig_i, rng)
-        s    = compute_summary(cat)
-        stats_list.append(s)
-
-    stats = np.stack(stats_list)
-    return theta_n, stats
+        cat = simulate_thomas(float(theta_raw[i, 0]),
+                              float(theta_raw[i, 1]), rng)
+        fields[i] = pixelise(cat)
+    return theta_n, fields
 
 
-def train_flow(flow: RealNVP,
-               theta_n: np.ndarray,
-               stats:   np.ndarray,
-               n_epochs: int = 200,
-               batch_size: int = 128,
-               lr: float = 3e-4,
-               device: str = "cpu") -> list[float]:
+def train_model(
+    model: FieldNPE,
+    theta_n: np.ndarray,
+    fields: np.ndarray,
+    *,
+    n_epochs: int   = 80,
+    batch_size: int = 256,
+    lr: float       = 5e-4,
+    device: str     = "cpu",
+    print_every: int = 20,
+) -> list[float]:
     """
-    Train the normalizing flow by maximising log p(theta | stats).
+    Train the FieldNPE by minimising −log p(θ | field).
 
-    The loss is the NEGATIVE mean log-probability (we minimise it):
-        L = -1/B * sum_i log p_phi(theta_i | stats_i)
-
-    Parameters
-    ----------
-    flow       : RealNVP model
-    theta_n    : (N, 2) normalised parameters
-    stats      : (N, N_STATS) summary statistics
-    n_epochs   : training epochs
-    batch_size : mini-batch size
-    lr         : learning rate
-    device     : 'cpu' or 'cuda'
-
-    Returns
-    -------
-    loss_history : list of per-epoch mean losses
+    Returns the per-epoch mean loss.
     """
-    flow.to(device).train()
-    opt   = torch.optim.Adam(flow.parameters(), lr=lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs,
-                                                         eta_min=1e-5)
-    N = len(theta_n)
-    rng_train = np.random.default_rng(0)
-    losses = []
+    model.to(device).train()
+    opt   = torch.optim.Adam(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=n_epochs, eta_min=1e-5,
+    )
+    N     = len(theta_n)
+    rng_t = np.random.default_rng(0)
+    losses: list[float] = []
 
-    for epoch in range(n_epochs):
-        idx = rng_train.permutation(N)
-        epoch_loss = 0.0
-        n_batches  = 0
+    for ep in range(n_epochs):
+        idx = rng_t.permutation(N)
+        ep_loss, n_batches = 0.0, 0
 
         for start in range(0, N, batch_size):
-            bi = idx[start: start + batch_size]
+            bi = idx[start : start + batch_size]
             if len(bi) < 4:
                 continue
-
             th = torch.from_numpy(theta_n[bi]).to(device)
-            st = torch.from_numpy(stats[bi]).to(device)
+            fl = torch.from_numpy(fields[bi]).to(device)
 
-            log_p = flow.log_prob(th, st)       # (B,)
-            loss  = -log_p.mean()
-
+            loss = -model.log_prob(th, fl).mean()
             opt.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(flow.parameters(), max_norm=2.0)
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             opt.step()
 
-            epoch_loss += loss.item()
-            n_batches  += 1
+            ep_loss   += loss.item()
+            n_batches += 1
 
         sched.step()
-        mean_loss = epoch_loss / max(n_batches, 1)
-        losses.append(mean_loss)
+        ml = ep_loss / max(n_batches, 1)
+        losses.append(ml)
 
-        if (epoch + 1) % 50 == 0:
-            lr_now = sched.get_last_lr()[0]
-            print(f"  Epoch {epoch+1:4d}/{n_epochs}: "
-                  f"loss = {mean_loss:.4f}   lr = {lr_now:.2e}")
+        if print_every and (ep + 1) % print_every == 0:
+            print(f"  Epoch {ep+1:4d}/{n_epochs}:  loss = {ml:.4f}")
 
     return losses
 
 
-# =============================================================================
-# SECTION 6 — POSTERIOR INFERENCE
-# =============================================================================
+#  8. Power-spectrum estimator (for the MCMC branch)
+
+
+def compute_pk(catalog: np.ndarray,
+               grid_size: int = GRID_SIZE,
+               L: float = 1.0) -> np.ndarray:
+    """
+    Isotropic P(k) via 2-D FFT of the pixelised density field.
+
+    Both the observed and model P(k) **must** pass through this same
+    function so that window-function effects and normalisation cancel
+    in the likelihood.
+    """
+    H, _, _ = np.histogram2d(
+        catalog[:, 0], catalog[:, 1],
+        bins=grid_size, range=[[0, L], [0, L]],
+    )
+    n_bar = H.mean()
+    if n_bar == 0:
+        return np.zeros(PK_BINS)
+
+    delta = (H - n_bar) / n_bar
+    ft    = np.fft.rfft2(delta)
+    pk2d  = np.abs(ft) ** 2 / grid_size ** 4
+
+    kx = np.fft.fftfreq(grid_size) * 2 * np.pi * grid_size
+    ky = np.fft.rfftfreq(grid_size) * 2 * np.pi * grid_size
+    KX, KY = np.meshgrid(kx, ky, indexing="ij")
+    K = np.sqrt(KX**2 + KY**2)
+
+    k_max   = np.pi * grid_size
+    k_edges = np.linspace(2 * np.pi, k_max * 0.8, PK_BINS + 1)
+    pk = np.zeros(PK_BINS)
+    for i in range(PK_BINS):
+        mask = (K >= k_edges[i]) & (K < k_edges[i + 1])
+        if mask.sum() > 0:
+            pk[i] = pk2d[mask].mean()
+    return pk
+
+
+#  9. MCMC — simulation-based P(k) likelihood
+
+
+def run_mcmc(
+    x_obs: np.ndarray,
+    *,
+    n_walkers: int = 24,
+    n_steps: int   = 1200,
+    discard: int   = 300,
+    n_avg: int     = 10,
+    n_cov_sims: int = 500,
+    fiducial: tuple[float, float] = (12.0, 0.05),
+    verbose: bool  = True,
+) -> np.ndarray:
+    
+    import emcee
+
+    pk_obs = compute_pk(x_obs)
+
+    # ── covariance at fiducial ───────────────────────────────────────
+    if verbose:
+        print(f"  Estimating P(k) covariance at fiducial "
+              f"μ={fiducial[0]}, σ={fiducial[1]} …")
+    rng_c   = np.random.default_rng(77)
+    pk_sims = np.array([
+        compute_pk(simulate_thomas(fiducial[0], fiducial[1], rng_c))
+        for _ in range(n_cov_sims)
+    ])
+    cov     = np.cov(pk_sims, rowvar=False)
+    hartlap = (n_cov_sims - PK_BINS - 2) / (n_cov_sims - 1)
+    inv_cov = hartlap * np.linalg.inv(
+        cov + 1e-12 * np.eye(PK_BINS)
+    )
+
+    # ── likelihood ───────────────────────────────────────────────────
+    def log_like(theta):
+        mu, sigma = theta
+        if not (MU_LO <= mu <= MU_HI and SIG_LO <= sigma <= SIG_HI):
+            return -np.inf
+        rng = np.random.default_rng()
+        pk_model = np.mean(
+            [compute_pk(simulate_thomas(mu, sigma, rng))
+             for _ in range(n_avg)],
+            axis=0,
+        )
+        diff = pk_obs - pk_model
+        return -0.5 * diff @ inv_cov @ diff
+
+    # ── run sampler ──────────────────────────────────────────────────
+    p0 = np.column_stack([
+        np.random.uniform(MU_LO + 1, MU_HI - 1, n_walkers),
+        np.random.uniform(SIG_LO + 0.005, SIG_HI - 0.005, n_walkers),
+    ])
+    if verbose:
+        print(f"  Running emcee ({n_walkers}×{n_steps}, "
+              f"{n_avg} sims/eval) …")
+
+    sampler = emcee.EnsembleSampler(n_walkers, 2, log_like)
+    sampler.run_mcmc(p0, n_steps, progress=verbose)
+    chain = sampler.get_chain(discard=discard, flat=True)
+
+    if verbose:
+        print(f"  MCMC: {len(chain)} samples")
+    return chain
+
+
+# 10. NPE posterior sampling
+
 
 @torch.no_grad()
-def get_posterior_samples(flow: RealNVP,
-                          stats_obs: np.ndarray,
-                          n_samples: int = 3000,
-                          device: str = "cpu") -> np.ndarray:
+def get_npe_samples(
+    model: FieldNPE,
+    x_obs: np.ndarray,
+    n_samples: int = 5000,
+    device: str    = "cpu",
+) -> np.ndarray:
     """
-    Draw samples from the approximate posterior p(mu, sigma | x_obs).
+    Draw posterior samples from the trained FieldNPE.
 
-    Parameters
-    ----------
-    flow      : trained RealNVP
-    stats_obs : (N_STATS,) summary statistics of the observed catalog
-    n_samples : number of posterior samples to draw
-
-    Returns
-    -------
-    samples : (n_valid, 2) array with columns [mu, sigma] in physical units
+    Returns physical-space samples (μ, σ) that lie within the prior.
     """
-    flow.eval()
-    st_t = torch.from_numpy(stats_obs[None]).to(device)   # (1, N_STATS)
+    model.eval()
+    field    = pixelise(x_obs)
+    field_t  = torch.from_numpy(field[np.newaxis]).to(device)   # (1,1,G,G)
+    samp_n   = model.sample(field_t, n_samples).cpu().numpy()   # normalised
+    samp     = unnormalise(samp_n)                               # physical
 
-    # Sample from the flow
-    samples_n = flow.sample(st_t, n_samples=n_samples)    # (n_samples, 2)
-    samples   = unnormalise(samples_n.cpu().numpy())       # back to (mu, sigma)
-
-    # Keep only samples within the prior (discard out-of-bounds)
     in_prior = (
-        (samples[:, 0] >= MU_LO)  & (samples[:, 0] <= MU_HI)  &
-        (samples[:, 1] >= SIG_LO) & (samples[:, 1] <= SIG_HI)
+        (samp[:, 0] >= MU_LO) & (samp[:, 0] <= MU_HI) &
+        (samp[:, 1] >= SIG_LO) & (samp[:, 1] <= SIG_HI)
     )
-    return samples[in_prior]
-
-
-# =============================================================================
-# SECTION 7 — VALIDATION
-# =============================================================================
-
-def sbc_validation(flow: RealNVP,
-                   n_tests: int = 200,
-                   n_posterior: int = 300,
-                   rng: np.random.Generator = None,
-                   device: str = "cpu") -> dict:
-    """
-    Simulation-Based Calibration (Talts et al. 2018).
-
-    IDEA: If the posterior is perfectly calibrated, then the rank of
-    theta_true in a sorted list of posterior samples is uniformly
-    distributed on {0, 1, …, L}.
-
-    Algorithm for each test:
-      1. Draw theta_true ~ prior
-      2. Simulate catalog x ~ Thomas(theta_true)
-      3. Compute posterior samples theta_1, …, theta_L ~ q(theta | x)
-      4. Record rank = #{i : theta_i < theta_true}
-
-    If ranks are uniform: well-calibrated.
-    If ranks cluster low: posterior is overestimating (too wide).
-    If ranks cluster high: posterior is underestimating (too narrow).
-
-    Returns
-    -------
-    dict with 'ranks' (n_tests, 2) and 'p_values' (2,)
-    """
-    if rng is None:
-        rng = np.random.default_rng(99)
-
-    flow.eval()
-    ranks = np.zeros((n_tests, 2), dtype=int)
-    theta_true_all = sample_prior(n_tests, rng)
-
-    print(f"  Running SBC with {n_tests} tests (L={n_posterior})…")
-    for i in range(n_tests):
-        mu_t, sig_t = float(theta_true_all[i, 0]), float(theta_true_all[i, 1])
-        cat     = simulate_thomas(mu_t, sig_t, rng)
-        stats   = compute_summary(cat)
-        samples = get_posterior_samples(flow, stats, n_posterior, device)
-
-        if len(samples) < 10:
-            continue
-
-        ranks[i, 0] = int((samples[:, 0] < mu_t).sum())
-        ranks[i, 1] = int((samples[:, 1] < sig_t).sum())
-
-        if (i + 1) % 50 == 0:
-            print(f"    {i+1}/{n_tests}")
-
-    # Chi-squared test for uniformity
-    n_bins = 10
-    p_vals = []
-    for d in range(2):
-        counts, _ = np.histogram(ranks[:, d], bins=n_bins,
-                                  range=(0, n_posterior))
-        expected  = n_tests / n_bins
-        chi2_stat = float(((counts - expected) ** 2 / expected).sum())
-        p_vals.append(chi2_dist.sf(chi2_stat, n_bins - 1))
-
-    return {"ranks": ranks, "p_values": np.array(p_vals), "n_posterior": n_posterior}
-
-
-def coverage_test(flow: RealNVP,
-                  n_tests: int = 200,
-                  n_posterior: int = 300,
-                  alpha_levels: tuple = (0.5, 0.68, 0.9, 0.95),
-                  rng: np.random.Generator = None,
-                  device: str = "cpu") -> dict:
-    """
-    Expected coverage test (Hermans et al. 2022).
-
-    For each nominal level alpha, check that the true parameter falls
-    inside the alpha-credible interval in fraction alpha of trials.
-
-    Returns
-    -------
-    dict with 'alpha_levels' and 'empirical_coverage' (n_alpha, 2)
-    """
-    if rng is None:
-        rng = np.random.default_rng(77)
-
-    flow.eval()
-    alpha_arr = np.array(alpha_levels)
-    in_ci     = np.zeros((n_tests, len(alpha_arr), 2), dtype=bool)
-    theta_true_all = sample_prior(n_tests, rng)
-
-    print(f"  Running coverage test with {n_tests} tests…")
-    for i in range(n_tests):
-        mu_t, sig_t = float(theta_true_all[i, 0]), float(theta_true_all[i, 1])
-        cat     = simulate_thomas(mu_t, sig_t, rng)
-        stats   = compute_summary(cat)
-        samples = get_posterior_samples(flow, stats, n_posterior, device)
-
-        if len(samples) < 10:
-            continue
-
-        for j, alpha in enumerate(alpha_arr):
-            half = (1.0 - alpha) / 2.0
-            lo_mu,  hi_mu  = np.quantile(samples[:, 0], [half, 1-half])
-            lo_sig, hi_sig = np.quantile(samples[:, 1], [half, 1-half])
-            in_ci[i, j, 0] = lo_mu  <= mu_t  <= hi_mu
-            in_ci[i, j, 1] = lo_sig <= sig_t <= hi_sig
-
-        if (i + 1) % 50 == 0:
-            print(f"    {i+1}/{n_tests}")
-
-    return {
-        "alpha_levels":       alpha_arr,
-        "empirical_coverage": in_ci.mean(axis=0),  # (n_alpha, 2)
-    }
-
-
-# =============================================================================
-# SECTION 8 — PLOTTING
-# =============================================================================
-
-def plot_example_catalogs(rng):
-    """Show what Thomas-process catalogs look like for different parameters."""
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-    fig.suptitle("Thomas Cluster Process: example realizations",
-                 fontsize=14, fontweight="bold")
-
-    configs = [
-        (5,  0.03, "μ=5,  σ=0.03\n(few tight clusters)"),
-        (15, 0.03, "μ=15, σ=0.03\n(many tight clusters)"),
-        (5,  0.09, "μ=5,  σ=0.09\n(few loose clusters)"),
-        (15, 0.09, "μ=15, σ=0.09\n(many loose clusters)"),
-    ]
-
-    for col, (mu, sigma, title) in enumerate(configs):
-        for row in range(2):
-            cat = simulate_thomas(mu, sigma, rng)
-            ax  = axes[row, col]
-            ax.scatter(cat[:, 0], cat[:, 1], s=4, alpha=0.6,
-                       c="#1B4965")
-            ax.set_xlim(0, 1); ax.set_ylim(0, 1)
-            ax.set_aspect("equal")
-            ax.set_xticks([]); ax.set_yticks([])
-            ax.text(0.03, 0.95, f"N={len(cat)}", transform=ax.transAxes,
-                    fontsize=8, va="top",
-                    bbox=dict(fc="white", alpha=0.7, boxstyle="round"))
-            if row == 0:
-                ax.set_title(title, fontsize=9, fontweight="bold")
-
-    plt.tight_layout()
-    plt.savefig(OUT / "1_example_catalogs.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: 1_example_catalogs.png")
-
-
-def plot_training_loss(losses: list):
-    """Plot the NPE training loss curve."""
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(losses, lw=1.5, c="#1B4965", alpha=0.8, label="Training loss")
-
-    # Smoothed curve
-    window = max(5, len(losses) // 15)
-    if len(losses) > window:
-        smooth = np.convolve(losses, np.ones(window) / window, mode="valid")
-        x_smooth = np.arange(len(smooth)) + window // 2
-        ax.plot(x_smooth, smooth,
-                lw=2.5, c="#C1121F", label=f"Moving average ({window})")
-
-    ax.set_xlabel("Epoch", fontsize=12)
-    ax.set_ylabel("−log p(θ | x)  [lower is better]", fontsize=12)
-    ax.set_title("NPE Training: Loss over Epochs", fontsize=13,
-                 fontweight="bold")
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(OUT / "2_training_loss.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: 2_training_loss.png")
-
-
-def plot_posterior(samples: np.ndarray,
-                   mu_true: float, sigma_true: float):
-    """
-    Plot the inferred posterior for (mu, sigma).
-    Shows both marginals and the joint 2D posterior.
-    """
-    fig = plt.figure(figsize=(14, 5))
-    gs  = gridspec.GridSpec(1, 3, wspace=0.4, figure=fig)
-
-    colors = {"npe": "#1B4965", "true": "#C1121F"}
-
-    # ── Marginal: mu ──────────────────────────────────────────────────────────
-    ax0 = fig.add_subplot(gs[0])
-    ax0.hist(samples[:, 0], bins=40, density=True,
-             color=colors["npe"], alpha=0.7, edgecolor="white", lw=0.3)
-    ax0.axvline(mu_true, c=colors["true"], lw=2.5, ls="--",
-                label=f"True μ = {mu_true:.1f}")
-    ax0.set_xlabel("μ  (mean galaxies / cluster)", fontsize=12)
-    ax0.set_ylabel("Posterior density", fontsize=11)
-    ax0.set_title("Marginal posterior: μ", fontsize=12, fontweight="bold")
-    ax0.legend(fontsize=10)
-    ax0.grid(True, alpha=0.3)
-
-    mu_lo, mu_hi = np.quantile(samples[:, 0], [0.025, 0.975])
-    ax0.axvspan(mu_lo, mu_hi, alpha=0.15, color=colors["npe"],
-                label="95% CI")
-    ax0.text(0.05, 0.92,
-             f"Mean: {samples[:,0].mean():.2f}\n"
-             f"Std:  {samples[:,0].std():.2f}",
-             transform=ax0.transAxes, fontsize=9,
-             bbox=dict(fc="lightyellow", ec="gold", alpha=0.9))
-
-    # ── Marginal: sigma ───────────────────────────────────────────────────────
-    ax1 = fig.add_subplot(gs[1])
-    ax1.hist(samples[:, 1], bins=40, density=True,
-             color="#4CAF50", alpha=0.7, edgecolor="white", lw=0.3)
-    ax1.axvline(sigma_true, c=colors["true"], lw=2.5, ls="--",
-                label=f"True σ = {sigma_true:.3f}")
-    ax1.set_xlabel("σ  (cluster spread, box units)", fontsize=12)
-    ax1.set_title("Marginal posterior: σ", fontsize=12, fontweight="bold")
-    ax1.legend(fontsize=10)
-    ax1.grid(True, alpha=0.3)
-
-    sig_lo, sig_hi = np.quantile(samples[:, 1], [0.025, 0.975])
-    ax1.axvspan(sig_lo, sig_hi, alpha=0.15, color="#4CAF50")
-    ax1.text(0.05, 0.92,
-             f"Mean: {samples[:,1].mean():.4f}\n"
-             f"Std:  {samples[:,1].std():.4f}",
-             transform=ax1.transAxes, fontsize=9,
-             bbox=dict(fc="lightyellow", ec="gold", alpha=0.9))
-
-    # ── Joint 2D posterior ────────────────────────────────────────────────────
-    ax2 = fig.add_subplot(gs[2])
-    ax2.scatter(samples[:, 0], samples[:, 1],
-                s=2, alpha=0.2, c=colors["npe"], rasterized=True)
-    ax2.plot(mu_true, sigma_true, "*", ms=14, c=colors["true"],
-             zorder=5, label="True parameters", markeredgecolor="white",
-             markeredgewidth=0.5)
-    ax2.set_xlabel("μ  (mean galaxies / cluster)", fontsize=12)
-    ax2.set_ylabel("σ  (cluster spread)", fontsize=12)
-    ax2.set_title("Joint posterior p(μ, σ | x)", fontsize=12,
-                  fontweight="bold")
-    ax2.legend(fontsize=10, loc="upper right")
-    ax2.set_xlim(MU_LO, MU_HI)
-    ax2.set_ylim(SIG_LO, SIG_HI)
-    ax2.grid(True, alpha=0.2)
-
-    fig.suptitle(
-        f"NPE Posterior  |  True: μ={mu_true:.1f}, σ={sigma_true:.3f}",
-        fontsize=13, fontweight="bold"
-    )
-    plt.savefig(OUT / "3_posterior.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: 3_posterior.png")
-
-
-def plot_sbc(sbc_result: dict):
-    """
-    Plot SBC rank histograms.
-    A uniform histogram = well-calibrated posterior.
-    """
-    ranks      = sbc_result["ranks"]
-    p_vals     = sbc_result["p_values"]
-    n_post     = sbc_result["n_posterior"]
-    n_tests    = ranks.shape[0]
-    n_bins     = 10
-    expected   = n_tests / n_bins
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle("Simulation-Based Calibration (SBC)",
-                 fontsize=14, fontweight="bold")
-
-    param_names = ["μ  (mean galaxies/cluster)",
-                   "σ  (cluster spread)"]
-    colors      = ["#6A4C93", "#1982C4"]
-
-    for d, (ax, name, col) in enumerate(zip(axes, param_names, colors)):
-        counts, edges = np.histogram(ranks[:, d], bins=n_bins,
-                                      range=(0, n_post))
-        bin_centers = (edges[:-1] + edges[1:]) / 2
-        ax.bar(bin_centers, counts,
-               width=(edges[1] - edges[0]) * 0.85,
-               color=col, alpha=0.75, edgecolor="black", lw=0.8)
-
-        # Expected uniform level + 2-sigma Poisson band
-        ax.axhline(expected, c="red", ls="--", lw=2,
-                   label=f"Uniform ({expected:.0f})")
-        ax.axhspan(expected - 2 * np.sqrt(expected),
-                   expected + 2 * np.sqrt(expected),
-                   alpha=0.2, color="red")
-
-        p = p_vals[d]
-        verdict = "✓ PASS" if p > 0.05 else "✗ FAIL"
-        ax.set_title(f"{name}\nχ² p-value = {p:.3f}   {verdict}",
-                     fontsize=11, fontweight="bold")
-        ax.set_xlabel("Rank of θ_true in posterior samples", fontsize=10)
-        ax.set_ylabel("Count", fontsize=10)
-        ax.legend(fontsize=10)
-        ax.grid(True, alpha=0.3, axis="y")
-
-    plt.tight_layout()
-    plt.savefig(OUT / "4_sbc.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: 4_sbc.png")
-
-
-def plot_coverage(cov_result: dict):
-    """
-    Plot expected vs. empirical coverage.
-    Perfect calibration = points lie on the diagonal y = x.
-    """
-    alphas = cov_result["alpha_levels"]
-    em_cov = cov_result["empirical_coverage"]
-
-    fig, ax = plt.subplots(figsize=(7, 6))
-
-    ax.plot([0, 1], [0, 1], "k--", lw=2, label="Perfect calibration")
-    ax.fill_between([0, 1], [-0.05, -0.05], [0.05, 0.05],
-                    alpha=0.0)   # placeholder
-    ax.fill_between(alphas,
-                    alphas - 0.05, alphas + 0.05,
-                    alpha=0.15, color="gray", label="±5% tolerance")
-
-    ax.plot(alphas, em_cov[:, 0], "o-", lw=2.5, ms=9,
-            c="#6A4C93", label="μ  (mean galaxies/cluster)")
-    ax.plot(alphas, em_cov[:, 1], "s-", lw=2.5, ms=9,
-            c="#1982C4", label="σ  (cluster spread)")
-
-    ax.set_xlabel("Nominal coverage level α", fontsize=13)
-    ax.set_ylabel("Empirical coverage", fontsize=13)
-    ax.set_title("Expected Coverage Test", fontsize=14, fontweight="bold")
-    ax.legend(fontsize=11, loc="upper left")
-    ax.grid(True, alpha=0.3)
-    ax.set_xlim(0.45, 1.0)
-    ax.set_ylim(0.3, 1.1)
-
-    plt.tight_layout()
-    plt.savefig(OUT / "5_coverage.png", dpi=150, bbox_inches="tight")
-    plt.show()
-    print("Saved: 5_coverage.png")
-
-
-def plot_posterior_predictive(flow: RealNVP,
-                              x_obs: np.ndarray,
-                              stats_obs: np.ndarray,
-                              mu_true: float,
-                              sigma_true: float,
-                              rng: np.random.Generator,
-                              device: str = "cpu"):
-    """
-    Posterior predictive check:
-    Draw (mu, sigma) from the posterior, simulate a new catalog, and
-    compare its summary statistics to those of the observed catalog.
-
-    If the posterior is correct, the simulated catalogs should look
-    statistically similar to x_obs.
-    """
-    samples = get_posterior_samples(flow, stats_obs, 500, device)
-    if len(samples) < 20:
-        print("  Not enough posterior samples for PPC. Skipping.")
-        return
-
-    # Simulate new catalogs from posterior draws
-    sim_stats = []
-    for mu_s, sig_s in samples[:200]:
-        cat = simulate_thomas(float(mu_s), float(sig_s), rng)
-        sim_stats.append(compute_summary(cat))
-    sim_stats = np.array(sim_stats)
-
-    stat_names = [
-        "log(1+N) / 5\n(galaxy count)",
-        "Mean NN dist × 10\n(clustering scale)",
-        "Std NN dist × 10\n(clustering variability)",
-        "Cluster fraction / 20\n(compactness)",
-        "Ripley L - r × 5\n(excess clustering)",
-    ]
-
-    fig, axes = plt.subplots(1, N_STATS, figsize=(18, 4))
-    fig.suptitle("Posterior Predictive Check\n"
-                 "(simulated catalogs should match observed stats)",
-                 fontsize=13, fontweight="bold")
-
-    for i, (ax, name) in enumerate(zip(axes, stat_names)):
-        ax.hist(sim_stats[:, i], bins=25, density=True,
-                color="#1B4965", alpha=0.6, label="Posterior predictive")
-        ax.axvline(stats_obs[i], c="#C1121F", lw=2.5, ls="--",
-                   label=f"Observed: {stats_obs[i]:.3f}")
-        ax.set_title(name, fontsize=8)
-        ax.legend(fontsize=7, loc="upper right")
-        ax.grid(True, alpha=0.3)
-        ax.set_yticks([])
-
-    plt.tight_layout()
-    plt.savefig(OUT / "6_posterior_predictive.png", dpi=150,
-                bbox_inches="tight")
-    plt.show()
-    print("Saved: 6_posterior_predictive.png")
-
-
-# =============================================================================
-# SECTION 9 — MAIN PIPELINE
-# =============================================================================
-
-def main():
-    print("=" * 65)
-    print(" Neural Posterior Estimation for the Thomas Cluster Process")
-    print(" Based on: Cranmer, Brehmer & Louppe (2020), PNAS")
-    print("=" * 65)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\n Device: {device}")
-    print(f" Output directory: {OUT.resolve()}\n")
-
-    t_start = time.time()
-
-    # ─── Step 1: Show example catalogs ───────────────────────────────────────
-    print("─" * 65)
-    print("STEP 1: Visualise the Thomas cluster process")
-    print("─" * 65)
-    rng = np.random.default_rng(SEED)
-    plot_example_catalogs(rng)
-
-    # ─── Step 2: Generate training data ──────────────────────────────────────
-    N_TRAIN = 3_000    # number of (theta, summary) pairs
-    print(f"\n{'─'*65}")
-    print(f"STEP 2: Generating {N_TRAIN} training simulations…")
-    print("─" * 65)
-    t0 = time.time()
-    theta_train, stats_train = generate_training_data(N_TRAIN, rng)
-    print(f" Done in {time.time()-t0:.1f}s  "
-          f"| theta shape: {theta_train.shape}, "
-          f"stats shape: {stats_train.shape}")
-
-    # ─── Step 3: Build and train the flow ────────────────────────────────────
-    print(f"\n{'─'*65}")
-    print("STEP 3: Training the normalizing flow (RealNVP)…")
-    print("─" * 65)
-    flow = RealNVP(context_dim=N_STATS, hidden=64, n_layers=3)
-    n_params = sum(p.numel() for p in flow.parameters())
-    print(f" Model parameters: {n_params:,}")
-
-    losses = train_flow(flow, theta_train, stats_train,
-                        n_epochs=300, batch_size=128, lr=3e-4,
-                        device=device)
-    plot_training_loss(losses)
-
-    # ─── Step 4: Generate a mock observation ─────────────────────────────────
-    MU_TRUE    = 12.0
-    SIGMA_TRUE = 0.05
-
-    print(f"\n{'─'*65}")
-    print(f"STEP 4: Generating mock observation")
-    print(f" True parameters: μ = {MU_TRUE}, σ = {SIGMA_TRUE}")
-    print("─" * 65)
-
-    rng_obs = np.random.default_rng(123)
-    x_obs   = simulate_thomas(MU_TRUE, SIGMA_TRUE, rng_obs)
-    stats_obs = compute_summary(x_obs)
-    print(f" Observed catalog: N = {len(x_obs)} galaxies")
-    print(f" Summary stats: {stats_obs}")
-
-    # ─── Step 5: Infer the posterior ─────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    print("STEP 5: Posterior inference")
-    print("─" * 65)
-    samples = get_posterior_samples(flow, stats_obs,
-                                    n_samples=5000, device=device)
-    print(f" Posterior samples (in prior): {len(samples)}")
-    print(f" μ  posterior: {samples[:,0].mean():.2f} ± {samples[:,0].std():.2f}"
-          f"  (true: {MU_TRUE})")
-    print(f" σ  posterior: {samples[:,1].mean():.4f} ± {samples[:,1].std():.4f}"
-          f"  (true: {SIGMA_TRUE})")
-
-    plot_posterior(samples, MU_TRUE, SIGMA_TRUE)
-
-    # ─── Step 6: Posterior predictive check ──────────────────────────────────
-    print(f"\n{'─'*65}")
-    print("STEP 6: Posterior predictive check")
-    print("─" * 65)
-    plot_posterior_predictive(flow, x_obs, stats_obs,
-                              MU_TRUE, SIGMA_TRUE, rng, device)
-
-    # ─── Step 7: SBC ─────────────────────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    print("STEP 7: Simulation-Based Calibration (SBC)")
-    print("─" * 65)
-    rng_val = np.random.default_rng(55)
-    sbc_res = sbc_validation(flow, n_tests=200, n_posterior=300,
-                              rng=rng_val, device=device)
-    plot_sbc(sbc_res)
-    print(f" SBC p-values:  μ = {sbc_res['p_values'][0]:.4f}, "
-          f"σ = {sbc_res['p_values'][1]:.4f}")
-    sbc_ok = (sbc_res["p_values"] > 0.05).all()
-    print(f" Calibration: {'PASSED ✓' if sbc_ok else 'FAILED ✗'}")
-
-    # ─── Step 8: Coverage test ────────────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    print("STEP 8: Expected coverage test")
-    print("─" * 65)
-    rng_cov = np.random.default_rng(77)
-    cov_res = coverage_test(flow, n_tests=200, n_posterior=300,
-                             rng=rng_cov, device=device)
-    plot_coverage(cov_res)
-
-    # ─── Final summary ────────────────────────────────────────────────────────
-    elapsed = time.time() - t_start
-    print(f"\n{'='*65}")
-    print(" PIPELINE COMPLETE")
-    print(f"{'='*65}")
-    print(f" Total runtime: {elapsed/60:.1f} min")
-    print(f" True parameters: μ = {MU_TRUE},  σ = {SIGMA_TRUE}")
-    print(f" NPE estimate:    μ = {samples[:,0].mean():.2f} ± {samples[:,0].std():.2f}")
-    print(f"                  σ = {samples[:,1].mean():.4f} ± {samples[:,1].std():.4f}")
-    print(f" SBC: {'PASS ✓' if sbc_ok else 'FAIL ✗'}  "
-          f"(p_mu={sbc_res['p_values'][0]:.3f}, "
-          f"p_sigma={sbc_res['p_values'][1]:.3f})")
-    print(f"\n All figures saved to: {OUT.resolve()}/")
-    print(f"{'='*65}")
-
-
-if __name__ == "__main__":
-    main()
+    return samp[in_prior]
